@@ -1,106 +1,93 @@
 import streamlit as st
 import folium
 import osmnx as ox
-import heapq
+import pandas as pd
 from opencage.geocoder import OpenCageGeocode
+import os
 
-# 🔑 Set your OpenCage API key here
+st.set_page_config(page_title="Dehradun Pizza Route Optimizer")
+st.title("🍕 Domino's Dehradun Route Optimizer")
+
 OPENCAGE_API_KEY = "0d01f656fc7042dbb49dbbc548fd6d62"
 geocoder = OpenCageGeocode(OPENCAGE_API_KEY)
 
-# 🎯 Custom Dijkstra's implementation
-def custom_dijkstra(G, source, target):
-    dist = {node: float('inf') for node in G.nodes}
-    prev = {node: None for node in G.nodes}
-    dist[source] = 0
-    visited = set()
-    queue = [(0, source)]
+@st.cache_data
+def load_branch_data():
+    df = pd.read_csv("dataset_ddun.csv")
+    return {row['Branch']: (row['Latitude'], row['Longitude']) for idx, row in df.iterrows()}
 
-    while queue:
-        current_dist, current_node = heapq.heappop(queue)
-        if current_node in visited:
-            continue
-        visited.add(current_node)
-
-        if current_node == target:
-            break
-
-        for neighbor in G.neighbors(current_node):
-            weight = G.edges[current_node, neighbor, 0].get('length', 1)
-            alt = current_dist + weight
-            if alt < dist[neighbor]:
-                dist[neighbor] = alt
-                prev[neighbor] = current_node
-                heapq.heappush(queue, (alt, neighbor))
-
-    path = []
-    current = target
-    while current is not None:
-        path.append(current)
-        current = prev[current]
-    path.reverse()
-
-    if path[0] != source:
-        raise ValueError("No path found")
-
-    return path, list(visited)
-
-# 🌍 Geocoding using OpenCage
-def get_coordinates(address):
-    result = geocoder.geocode(address)
+@st.cache_data
+def get_coordinates_cached(address):
+    query = f"{address}, Dehradun, India"
+    result = geocoder.geocode(query)
     if result and len(result):
-        lat = result[0]['geometry']['lat']
-        lng = result[0]['geometry']['lng']
-        return lat, lng
-    else:
-        st.error(f"❌ Could not find coordinates for: {address}")
-        return None, None
+        return result[0]['geometry']['lat'], result[0]['geometry']['lng']
+    return None, None
 
-# 🗺️ Main plotting function
-def plot_route_map(start_address, end_address):
-    start_lat, start_lng = get_coordinates(start_address)
-    end_lat, end_lng = get_coordinates(end_address)
-    if not start_lat or not end_lat:
+def compute_path(G, orig_node, dest_node):
+    return ox.shortest_path(G, orig_node, dest_node, weight='length')
+
+def load_or_create_graph(lat, lng, dist=4000):
+    graph_path = "dehradun_graph.graphml"
+    if os.path.exists(graph_path):
+        G = ox.load_graphml(graph_path)
+    else:
+        G = ox.graph_from_point((lat, lng), dist=dist, network_type='drive')
+        ox.save_graphml(G, graph_path)
+    return G
+
+def plot_route_map(start_coords, end_address):
+    start_lat, start_lng = start_coords
+    end_lat, end_lng = get_coordinates_cached(end_address)
+
+    st.write("📍 Start Coordinates:", start_lat, start_lng)
+    st.write("📍 End Coordinates:", end_lat, end_lng)
+
+    if None in (start_lat, start_lng, end_lat, end_lng):
+        st.error("❌ Geocoding failed: Delivery address could not be located.")
         return None
 
-    G = ox.graph_from_point((start_lat, start_lng), dist=5000, network_type='drive')
-    orig_node = ox.distance.nearest_nodes(G, start_lng, start_lat)
-    dest_node = ox.distance.nearest_nodes(G, end_lng, end_lat)
+    try:
+        G = load_or_create_graph(start_lat, start_lng, dist=4000)
+    except ValueError as ve:
+        st.error("❌ Failed to create or load graph: " + str(ve))
+        return None
 
     try:
-        path, visited = custom_dijkstra(G, orig_node, dest_node)
-    except ValueError as e:
-        st.error(str(e))
+        orig_node = ox.distance.nearest_nodes(G, start_lng, start_lat)
+        dest_node = ox.distance.nearest_nodes(G, end_lng, end_lat)
+        path = compute_path(G, orig_node, dest_node)
+        if not path or len(path) < 2:
+            st.error("❌ Route could not be calculated.")
+            return None
+    except Exception as e:
+        st.error(f"❌ Routing failed: {e}")
         return None
 
     route_coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in path]
-    visited_coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in visited]
 
-    m = folium.Map(location=[start_lat, start_lng], zoom_start=14)
-    folium.Marker([start_lat, start_lng], popup="Start", icon=folium.Icon(color='green')).add_to(m)
-    folium.Marker([end_lat, end_lng], popup="End", icon=folium.Icon(color='red')).add_to(m)
-    for coord in visited_coords:
-        folium.CircleMarker(coord, radius=2, color='gray', fill=True, fill_opacity=0.2).add_to(m)
+    m = folium.Map(location=[start_lat, start_lng], zoom_start=13)
+    folium.Marker([start_lat, start_lng], popup="Start (Branch)", icon=folium.Icon(color='green')).add_to(m)
+    folium.Marker([end_lat, end_lng], popup="Delivery Destination", icon=folium.Icon(color='red')).add_to(m)
     folium.PolyLine(route_coords, color="blue", weight=5, opacity=0.9).add_to(m)
 
-    map_file = "custom_dijkstra_map.html"
+    map_file = "optimized_dijkstra_map.html"
     m.save(map_file)
     return map_file
 
-# 🎛️ Streamlit UI
-st.set_page_config(page_title="Manual Dijkstra Visualizer")
-st.title("🧠 Manual Dijkstra’s Route Finder with Folium Map")
+branch_coords = load_branch_data()
+branches = list(branch_coords.keys())
 
-st.markdown("Enter two locations to find the shortest path using your own Dijkstra algorithm, powered by OpenCage Geocoding.")
+selected_branch = st.selectbox("📍 Select Domino's Branch", branches)
+destination = st.text_input("🏠 Enter Delivery Destination", placeholder="e.g. ONGC chowk, Dehradun")
 
-start_input = st.text_input("Start Location", placeholder="e.g. Vasant Vihar, Dehradun")
-end_input = st.text_input("End Location", placeholder="e.g. Engineers Enclave, Dehradun")
-
-if st.button("Find Route"):
-    if start_input and end_input:
-        map_file = plot_route_map(start_input, end_input)
+if st.button("🚗 Get Route"):
+    if selected_branch and destination:
+        start_coords = branch_coords[selected_branch]
+        map_file = plot_route_map(start_coords, destination)
         if map_file:
-            st.success("✅ Route generated using Dijkstra!")
-            st.components.v1.html(open(map_file, 'r').read(), height=600)
+            st.success("✅ Route generated!")
+            with open(map_file, 'r', encoding='utf-8') as f:
+                st.components.v1.html(f.read(), height=600)
     else:
-        st.warning("⚠️ Please enter both start and end locations.")
+        st.warning("⚠️ Please select a branch and enter a delivery address.")
